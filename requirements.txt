@@ -1,0 +1,6 @@
+llama-index-core
+llama-index-llms-groq
+streamlit
+plotly
+sqlalchemy
+pandas
