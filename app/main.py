@@ -30,8 +30,10 @@ import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import logging
 
 import pandas as pd
+import numpy as np
 import plotly.express as px
 from pydantic import PrivateAttr
 from sqlalchemy import create_engine
@@ -43,6 +45,14 @@ from llama_index.core.llms import ChatMessage, ChatResponse, CompletionResponse,
 from llama_index.core.prompts import PromptType
 from llama_index.core.query_engine import NLSQLTableQueryEngine
 from llama_index.llms.groq import Groq
+from sentence_transformers import SentenceTransformer
+
+
+logger = logging.getLogger(__name__)
+if os.getenv("DEBUG_CACHE") == "1":
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        logger.addHandler(logging.StreamHandler())
 
 # --------------------------------------------------------------------------------------
 # Config
@@ -376,21 +386,95 @@ def build_schema_context(db_path: Path, notes: str = "", max_chars: int = MAX_CO
 # --------------------------------------------------------------------------------------
 # 3. LLM cache + CachedGroq
 # --------------------------------------------------------------------------------------
+_QUESTION_LINE_RE = re.compile(r"^Question:\s*(.+)$", re.M)
+
+
+def _extract_semantic_text(payload: Any) -> str:
+    """Extract the user's question from prompt templates so schema/table text doesn't dilute embeddings."""
+    raw = json.dumps(payload, default=str) if not isinstance(payload, str) else payload
+    matches = _QUESTION_LINE_RE.findall(raw)
+    if matches:
+        for candidate in reversed(matches):
+            cleaned = candidate.strip()
+            if cleaned and cleaned.lower() != "question here":
+                return cleaned
+    return raw.strip()
+
+
+def _schema_fingerprint(payload: Any) -> str:
+    """Hash static prompt/schema context separately from the variable question."""
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    without_question = _QUESTION_LINE_RE.sub("Question: <VAR>", raw)
+    return hashlib.sha256(without_question.encode()).hexdigest()
+
+
 class LLMCache:
     """
-    Persistent key-value cache for LLM responses (SQLite file). Create one instance per user session:
-    the file is shared (so repeated questions are free for everybody) but hit/miss counters are per instance.
+    Two-tier persistent cache for LLM responses (SQLite):
+      1. Exact SHA-256 lookup.
+      2. Semantic cosine-similarity lookup over extracted questions within the same scope.
     """
 
-    def __init__(self, path: Path = DEFAULT_CACHE_PATH, ttl_seconds: Optional[int] = None):
+    _embedder: Any = None
+    _embedder_failed: bool = False
+    _embedder_lock = threading.Lock()
+
+    def __init__(
+        self,
+        path: Path = DEFAULT_CACHE_PATH,
+        ttl_seconds: Optional[int] = None,
+        similarity_threshold: float = 0.85,
+        embed_model_name: str = "all-MiniLM-L6-v2",
+    ):
         self.path = str(path)
         self.ttl = ttl_seconds
+        self.similarity_threshold = similarity_threshold
+        self.embed_model_name = embed_model_name
         self.hits = 0
+        self.semantic_hits = 0
         self.misses = 0
-        self._lock = threading.Lock()        # serialises sqlite access
-        self._stat_lock = threading.Lock()   # protects hits/misses
-        self._exec("PRAGMA journal_mode=WAL")  # concurrent readers + a writer without 'database is locked'
-        self._exec("CREATE TABLE IF NOT EXISTS llm_cache (key TEXT PRIMARY KEY, response TEXT, created REAL)")
+        self._lock = threading.Lock()
+        self._stat_lock = threading.Lock()
+
+        self._exec("PRAGMA journal_mode=WAL")
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS llm_cache (
+                key TEXT PRIMARY KEY,
+                scope_hash TEXT,
+                semantic_text TEXT,
+                embedding BLOB,
+                response TEXT,
+                created REAL
+            )
+            """
+        )
+        existing_cols = {r[1] for r in self._exec("PRAGMA table_info(llm_cache)")}
+        for col, col_type in (("scope_hash", "TEXT"), ("semantic_text", "TEXT"), ("embedding", "BLOB")):
+            if col not in existing_cols:
+                self._exec(f"ALTER TABLE llm_cache ADD COLUMN {col} {col_type}")
+        self._exec("CREATE INDEX IF NOT EXISTS ix_llm_cache_scope ON llm_cache(scope_hash)")
+
+    def _get_embedder(self):
+        if SentenceTransformer is None or LLMCache._embedder_failed:
+            return None
+        if LLMCache._embedder is None:
+            with LLMCache._embedder_lock:
+                if LLMCache._embedder is None and not LLMCache._embedder_failed:
+                    try:
+                        LLMCache._embedder = SentenceTransformer(self.embed_model_name)
+                        logger.info("Loaded semantic cache embedder: %s", self.embed_model_name)
+                    except Exception as exc:  # noqa: BLE001
+                        LLMCache._embedder_failed = True
+                        logger.warning("Semantic embedder unavailable (%s); using exact cache only.", exc)
+        return LLMCache._embedder
+
+    def _encode(self, text: str) -> Optional[np.ndarray]:
+        embedder = self._get_embedder()
+        if embedder is None or not text:
+            return None
+        vec = embedder.encode(text, normalize_embeddings=True)
+        return np.asarray(vec, dtype=np.float32)
 
     def _exec(self, sql: str, params: tuple = ()):
         with self._lock:
@@ -407,12 +491,69 @@ class LLMCache:
         raw = json.dumps({"m": model, "t": temperature, "p": payload}, sort_keys=True, default=str)
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    def get(self, key: str) -> Optional[str]:
+    @staticmethod
+    def make_scope(model: str, temperature: float, settings: Any, payload: Any) -> str:
+        raw = json.dumps(
+            {"m": model, "t": temperature, "s": settings, "ctx": _schema_fingerprint(payload)},
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def get(
+        self,
+        key: str,
+        scope_hash: Optional[str] = None,
+        semantic_text: Optional[str] = None,
+    ) -> Optional[tuple[str, str]]:
+        now = time.time()
+
+        # 1. Exact match check
         rows = self._exec("SELECT response, created FROM llm_cache WHERE key = ?", (key,))
-        if rows and (self.ttl is None or time.time() - rows[0][1] < self.ttl):
+        if rows and (self.ttl is None or now - rows[0][1] < self.ttl):
             with self._stat_lock:
                 self.hits += 1
-            return rows[0][0]
+            logger.info("CACHE EXACT HIT | q=%r", (semantic_text or "")[:80])
+            return rows[0][0], key
+
+        # 2. Semantic match check within same scope
+        if scope_hash and semantic_text:
+            query_vec = self._encode(semantic_text)
+            if query_vec is not None:
+                candidates = self._exec(
+                    "SELECT key, semantic_text, embedding, response, created FROM llm_cache "
+                    "WHERE scope_hash = ? AND embedding IS NOT NULL",
+                    (scope_hash,),
+                )
+                best_score = -1.0
+                best_cached_q = ""
+                best_row: Optional[tuple[str, str]] = None
+                for cand_key, cand_q, blob, resp, created in candidates:
+                    if self.ttl is not None and now - created >= self.ttl:
+                        continue
+                    cand_vec = np.frombuffer(blob, dtype=np.float32)
+                    if cand_vec.shape != query_vec.shape:
+                        continue
+                    score = float(np.dot(query_vec, cand_vec))
+                    if score > best_score:
+                        best_score = score
+                        best_cached_q = cand_q or ""
+                        best_row = (resp, cand_key)
+
+                logger.info(
+                    "CACHE SEMANTIC CHECK | best=%.4f (thresh=%.2f) | cur=%r vs cached=%r | pool=%d",
+                    best_score,
+                    self.similarity_threshold,
+                    semantic_text[:70],
+                    best_cached_q[:70],
+                    len(candidates),
+                )
+                if best_row is not None and best_score >= self.similarity_threshold:
+                    with self._stat_lock:
+                        self.hits += 1
+                        self.semantic_hits += 1
+                    return best_row
+
         with self._stat_lock:
             self.misses += 1
         return None
@@ -420,21 +561,37 @@ class LLMCache:
     def delete(self, key: str) -> None:
         self._exec("DELETE FROM llm_cache WHERE key = ?", (key,))
 
-    def set(self, key: str, response: str) -> None:
-        self._exec("INSERT OR REPLACE INTO llm_cache (key, response, created) VALUES (?, ?, ?)",
-                   (key, response, time.time()))
+    def set(
+        self,
+        key: str,
+        response: str,
+        scope_hash: Optional[str] = None,
+        semantic_text: Optional[str] = None,
+    ) -> None:
+        vec = self._encode(semantic_text) if semantic_text else None
+        blob = vec.tobytes() if vec is not None else None
+        self._exec(
+            "INSERT OR REPLACE INTO llm_cache (key, scope_hash, semantic_text, embedding, response, created) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (key, scope_hash, semantic_text, blob, response, time.time()),
+        )
 
     def size(self) -> int:
         return self._exec("SELECT COUNT(*) FROM llm_cache")[0][0]
 
     def clear(self) -> None:
         self._exec("DELETE FROM llm_cache")
-        self.hits = self.misses = 0
+        self.hits = self.semantic_hits = self.misses = 0
 
     def stats(self) -> Dict[str, Any]:
         total = self.hits + self.misses
-        return {"entries": self.size(), "hits": self.hits, "misses": self.misses,
-                "hit_rate": round(self.hits / total, 2) if total else 0.0}
+        return {
+            "entries": self.size(),
+            "hits": self.hits,
+            "semantic_hits": self.semantic_hits,
+            "misses": self.misses,
+            "hit_rate": round(self.hits / total, 2) if total else 0.0,
+        }
 
 
 THINK_REGEX = re.compile(r"<think>.*?</think>", re.S | re.I)
@@ -456,23 +613,23 @@ def _require_answer(text: Optional[str]) -> str:
 
 
 class CachedGroq(Groq):
-    """Groq LLM whose chat()/complete() are served from LLMCache when the exact same prompt was seen."""
+    """Groq LLM whose chat()/complete() use exact + semantic LLMCache."""
 
     _llm_cache: Optional[LLMCache] = PrivateAttr(default=None)
-    _local: Any = PrivateAttr(default_factory=threading.local)   # last cache key, per thread
+    _local: Any = PrivateAttr(default_factory=threading.local)
 
     def __init__(self, *args, llm_cache: Optional[LLMCache] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self._llm_cache = llm_cache
 
-    def _key(self, payload) -> str:
-        # max_tokens / reasoning settings are part of the key so changing them never serves stale answers
+    def _keys(self, payload) -> tuple[str, str, str]:
         settings = [self.max_tokens, self.additional_kwargs]
-        return LLMCache.make_key(self.model, self.temperature, [settings, payload])
+        exact_key = LLMCache.make_key(self.model, self.temperature, [settings, payload])
+        scope_hash = LLMCache.make_scope(self.model, self.temperature, settings, payload)
+        semantic_text = _extract_semantic_text(payload)
+        return exact_key, scope_hash, semantic_text
 
     def evict_last(self) -> None:
-        """Drop this thread's most recent cache entry. Used when the SQL it produced turned out to be broken,
-        so a bad generation is never replayed from the cache."""
         key = getattr(self._local, "last_key", None)
         if self._llm_cache is not None and key:
             self._llm_cache.delete(key)
@@ -482,31 +639,38 @@ class CachedGroq(Groq):
         cache = self._llm_cache
         if cache is None:
             return super().chat(messages, **kwargs)
-        key = self._key([[m.role.value, str(m.content)] for m in messages])
-        self._local.last_key = key
-        hit = cache.get(key)
+        payload = [[m.role.value, str(m.content)] for m in messages]
+        key, scope_hash, semantic_text = self._keys(payload)
+        hit = cache.get(key, scope_hash=scope_hash, semantic_text=semantic_text)
         if hit is not None:
-            return ChatResponse(message=ChatMessage(role=MessageRole.ASSISTANT, content=hit),
-                                raw={"cached": True})
+            text, matched_key = hit
+            self._local.last_key = matched_key
+            return ChatResponse(
+                message=ChatMessage(role=MessageRole.ASSISTANT, content=text),
+                raw={"cached": True, "semantic": matched_key != key},
+            )
+        self._local.last_key = key
         resp = super().chat(messages, **kwargs)
-        text = _require_answer(resp.message.content)      # never cache empty / unfinished answers
-        cache.set(key, text)
+        text = _require_answer(resp.message.content)
+        cache.set(key, text, scope_hash=scope_hash, semantic_text=semantic_text)
         return ChatResponse(message=ChatMessage(role=MessageRole.ASSISTANT, content=text), raw=resp.raw)
 
     def complete(self, prompt: str, formatted: bool = False, **kwargs) -> CompletionResponse:
         cache = self._llm_cache
         if cache is None:
             return super().complete(prompt, formatted=formatted, **kwargs)
-        key = self._key(["complete", prompt])
-        self._local.last_key = key
-        hit = cache.get(key)
+        payload = ["complete", prompt]
+        key, scope_hash, semantic_text = self._keys(payload)
+        hit = cache.get(key, scope_hash=scope_hash, semantic_text=semantic_text)
         if hit is not None:
-            return CompletionResponse(text=hit, raw={"cached": True})
+            text, matched_key = hit
+            self._local.last_key = matched_key
+            return CompletionResponse(text=text, raw={"cached": True, "semantic": matched_key != key})
+        self._local.last_key = key
         resp = super().complete(prompt, formatted=formatted, **kwargs)
         text = _require_answer(resp.text)
-        cache.set(key, text)
+        cache.set(key, text, scope_hash=scope_hash, semantic_text=semantic_text)
         return CompletionResponse(text=text, raw=resp.raw)
-
 
 def make_llm(api_key: str, model: str, cache: Optional[LLMCache] = None,
              temperature: float = 0.0, max_tokens: int = 2000) -> CachedGroq:
