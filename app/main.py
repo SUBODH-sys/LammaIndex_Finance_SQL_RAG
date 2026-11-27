@@ -45,8 +45,11 @@ from llama_index.core.llms import ChatMessage, ChatResponse, CompletionResponse,
 from llama_index.core.prompts import PromptType
 from llama_index.core.query_engine import NLSQLTableQueryEngine
 from llama_index.llms.groq import Groq
-from sentence_transformers import SentenceTransformer
 
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
 
 logger = logging.getLogger(__name__)
 if os.getenv("DEBUG_CACHE") == "1":
@@ -70,7 +73,7 @@ MAX_CONTEXT_CHARS = 9000      # cap on the data dictionary so prompts stay insid
 SUPPORTED_EXTENSIONS = (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls")
 
 EXAMPLE_NOTES = (
-    "Money columns (total_revenue, net_income, market_cap_usd_m ...) are in USD millions.\n"
+    "Money columns (total_revenue, net_income, market_cap_usd_m ...) are in USD Billions.\n"
     "Columns ending in _pct are percentages (12.5 means 12.5%).\n"
     "p_e_ratio is NULL when earnings are negative.\n"
     "Join financials and stock_market on ticker AND year."
@@ -386,26 +389,81 @@ def build_schema_context(db_path: Path, notes: str = "", max_chars: int = MAX_CO
 # --------------------------------------------------------------------------------------
 # 3. LLM cache + CachedGroq
 # --------------------------------------------------------------------------------------
-_QUESTION_LINE_RE = re.compile(r"^Question:\s*(.+)$", re.M)
+_QUESTION_LINE_RE = re.compile(r"^Question:[ \t]*(.+)$", re.M)
+
+def _prompt_text(messages) -> str:
+    """Real prompt text (with real newlines), not its JSON dump."""
+    return "\n".join(str(m.content) for m in messages)
 
 
-def _extract_semantic_text(payload: Any) -> str:
-    """Extract the user's question from prompt templates so schema/table text doesn't dilute embeddings."""
-    raw = json.dumps(payload, default=str) if not isinstance(payload, str) else payload
-    matches = _QUESTION_LINE_RE.findall(raw)
-    if matches:
-        for candidate in reversed(matches):
-            cleaned = candidate.strip()
-            if cleaned and cleaned.lower() != "question here":
-                return cleaned
-    return raw.strip()
+def _extract_semantic_text(prompt: str) -> Optional[str]:
+    """The user's question, or None if the prompt has no 'Question:' line."""
+    for cand in reversed(_QUESTION_LINE_RE.findall(prompt)):
+        cand = cand.strip()
+        if cand and cand.lower() != "question here":      # skip the format example in the template
+            return cand
+    return None
 
 
-def _schema_fingerprint(payload: Any) -> str:
-    """Hash static prompt/schema context separately from the variable question."""
-    raw = json.dumps(payload, sort_keys=True, default=str)
-    without_question = _QUESTION_LINE_RE.sub("Question: <VAR>", raw)
-    return hashlib.sha256(without_question.encode()).hexdigest()
+def _schema_fingerprint(prompt: str) -> str:
+    """Hash of everything in the prompt except the question."""
+    masked = _QUESTION_LINE_RE.sub("Question: <VAR>", prompt)
+    return hashlib.sha256(masked.encode()).hexdigest()
+
+
+# --- guard: embeddings treat "2022" vs "2023", "highest" vs "lowest", "Apple" vs "Microsoft" as near-identical
+_NUM_RE = re.compile(r"\d+(?:[.,]\d+)*")
+_CANON = {
+    **dict.fromkeys(["highest", "top", "max", "maximum", "most", "best", "largest", "biggest",
+                     "desc", "descending"], "HI"),
+    **dict.fromkeys(["lowest", "bottom", "min", "minimum", "least", "worst", "smallest",
+                     "asc", "ascending"], "LO"),
+    **dict.fromkeys(["increase", "increased", "growth", "grew", "rise", "rose", "gain"], "UP"),
+    **dict.fromkeys(["decrease", "decreased", "decline", "declined", "fall", "fell", "drop", "loss"], "DOWN"),
+    **dict.fromkeys(["above", "over", "after", "greater", "more"], "GT"),
+    **dict.fromkeys(["below", "under", "before", "less", "fewer"], "LT"),
+}
+_STARTERS = {"what", "which", "who", "how", "show", "list", "give", "plot", "chart", "graph", "compare",
+             "find", "tell", "display", "is", "are", "was", "were", "do", "does", "did", "can", "please",
+             "total", "average", "create", "draw", "visualize", "visualise"}
+
+
+def _intent_signature(q: str) -> tuple:
+    """Numbers, direction words and proper nouns must match for two questions to share SQL."""
+    q = q.replace("'s", "").replace("’s", "")
+    words = [w.rstrip(".-") for w in re.findall(r"[A-Za-z][A-Za-z0-9&.\-]*", q)]
+    nums = frozenset(n.replace(",", "") for n in _NUM_RE.findall(q))
+    flags = frozenset(_CANON[w.lower()] for w in words if w.lower() in _CANON)
+    ents = frozenset(w.lower() for i, w in enumerate(words)
+                     if w[:1].isupper() and not (i == 0 and w.lower() in _STARTERS))
+    return nums, flags, ents
+
+_SCHEMA_TERMS: set = set()
+_GENERIC = {"id", "name", "date", "year", "total", "per", "col", "tbl", "usd", "pct", "the", "and"}
+
+
+def _stem(w: str) -> str:
+    return w[:-1] if len(w) > 3 and w.endswith("s") else w
+
+
+def register_schema_terms(columns_by_table: Dict[str, List[str]]) -> None:
+    """Remember the words used in table/column names (called once when the assistant is built)."""
+    for t, cols in columns_by_table.items():
+        for ident in [t, *cols]:
+            for w in ident.lower().split("_"):
+                if len(w) > 2 and not w.isdigit() and w not in _GENERIC:
+                    _SCHEMA_TERMS.add(_stem(w))
+
+
+def _schema_terms_in(q: str) -> frozenset:
+    return frozenset(s for s in (_stem(w) for w in re.findall(r"[a-z]+", q.lower())) if s in _SCHEMA_TERMS)
+
+
+def _same_intent(a: str, b: str) -> bool:
+    if _intent_signature(a) != _intent_signature(b):
+        return False
+    ta, tb = _schema_terms_in(a), _schema_terms_in(b)
+    return not (ta and tb and ta != tb)
 
 
 class LLMCache:
@@ -423,7 +481,7 @@ class LLMCache:
         self,
         path: Path = DEFAULT_CACHE_PATH,
         ttl_seconds: Optional[int] = None,
-        similarity_threshold: float = 0.85,
+        similarity_threshold: float = 0.80,
         embed_model_name: str = "all-MiniLM-L6-v2",
     ):
         self.path = str(path)
@@ -492,11 +550,10 @@ class LLMCache:
         return hashlib.sha256(raw.encode()).hexdigest()
 
     @staticmethod
-    def make_scope(model: str, temperature: float, settings: Any, payload: Any) -> str:
+    def make_scope(model: str, temperature: float, settings: Any, prompt: str) -> str:
         raw = json.dumps(
-            {"m": model, "t": temperature, "s": settings, "ctx": _schema_fingerprint(payload)},
-            sort_keys=True,
-            default=str,
+            {"m": model, "t": temperature, "s": settings, "ctx": _schema_fingerprint(prompt)},
+            sort_keys=True, default=str,
         )
         return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -527,9 +584,13 @@ class LLMCache:
                 )
                 best_score = -1.0
                 best_cached_q = ""
-                best_row: Optional[tuple[str, str]] = None
+                best_row=None
+                skipped=0
                 for cand_key, cand_q, blob, resp, created in candidates:
                     if self.ttl is not None and now - created >= self.ttl:
+                        continue
+                    if not _same_intent(semantic_text, cand_q or ""):     
+                        skipped += 1
                         continue
                     cand_vec = np.frombuffer(blob, dtype=np.float32)
                     if cand_vec.shape != query_vec.shape:
@@ -616,17 +677,23 @@ class CachedGroq(Groq):
     """Groq LLM whose chat()/complete() use exact + semantic LLMCache."""
 
     _llm_cache: Optional[LLMCache] = PrivateAttr(default=None)
+    _semantic: bool = PrivateAttr(default=False)
     _local: Any = PrivateAttr(default_factory=threading.local)
 
-    def __init__(self, *args, llm_cache: Optional[LLMCache] = None, **kwargs):
+    def __init__(self, *args, llm_cache: Optional[LLMCache] = None, semantic: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self._llm_cache = llm_cache
+        self._semantic = semantic
 
-    def _keys(self, payload) -> tuple[str, str, str]:
+    def _keys(self, payload, prompt: str):
         settings = [self.max_tokens, self.additional_kwargs]
         exact_key = LLMCache.make_key(self.model, self.temperature, [settings, payload])
-        scope_hash = LLMCache.make_scope(self.model, self.temperature, settings, payload)
-        semantic_text = _extract_semantic_text(payload)
+        if not self._semantic:
+            return exact_key, None, None                  # exact-only (answers, rewrites, chart specs)
+        semantic_text = _extract_semantic_text(prompt)
+        if semantic_text is None:
+            return exact_key, None, None
+        scope_hash = LLMCache.make_scope(self.model, self.temperature, settings, prompt)
         return exact_key, scope_hash, semantic_text
 
     def evict_last(self) -> None:
@@ -640,7 +707,7 @@ class CachedGroq(Groq):
         if cache is None:
             return super().chat(messages, **kwargs)
         payload = [[m.role.value, str(m.content)] for m in messages]
-        key, scope_hash, semantic_text = self._keys(payload)
+        key, scope_hash, semantic_text = self._keys(payload, _prompt_text(messages))
         hit = cache.get(key, scope_hash=scope_hash, semantic_text=semantic_text)
         if hit is not None:
             text, matched_key = hit
@@ -660,7 +727,7 @@ class CachedGroq(Groq):
         if cache is None:
             return super().complete(prompt, formatted=formatted, **kwargs)
         payload = ["complete", prompt]
-        key, scope_hash, semantic_text = self._keys(payload)
+        key, scope_hash, semantic_text = self._keys(payload, prompt)
         hit = cache.get(key, scope_hash=scope_hash, semantic_text=semantic_text)
         if hit is not None:
             text, matched_key = hit
@@ -672,8 +739,7 @@ class CachedGroq(Groq):
         cache.set(key, text, scope_hash=scope_hash, semantic_text=semantic_text)
         return CompletionResponse(text=text, raw=resp.raw)
 
-def make_llm(api_key: str, model: str, cache: Optional[LLMCache] = None,
-             temperature: float = 0.0, max_tokens: int = 2000) -> CachedGroq:
+def make_llm(api_key, model, cache= None, temperature=0.0, max_tokens=2000, semantic=False) -> CachedGroq:
     """
     Create one cached Groq LLM. Nothing global is touched (no Settings.llm, no os.environ), so several
     Streamlit sessions with different API keys can run side by side safely.
@@ -684,12 +750,12 @@ def make_llm(api_key: str, model: str, cache: Optional[LLMCache] = None,
     if model.startswith("openai/gpt-oss"):
         extra["additional_kwargs"] = {"reasoning_effort": "low"}   # faster, far fewer hidden-thinking tokens
     return CachedGroq(model=model, api_key=api_key, temperature=temperature,
-                      max_tokens=max_tokens, llm_cache=cache, **extra)
+                      max_tokens=max_tokens, llm_cache=cache, semantic=semantic, **extra)
 
 
-def make_llms(api_key: str, cache: Optional[LLMCache] = None):
+def make_llms(api_key, cache=None):
     """Return (sql_llm, text_llm): gpt-oss-120b for SQL, gpt-oss-20b for English. Both share one cache."""
-    return make_llm(api_key, SQL_MODEL, cache), make_llm(api_key, TEXT_MODEL, cache)
+    return make_llm(api_key, SQL_MODEL, cache, semantic=True), make_llm(api_key, TEXT_MODEL, cache)
 
 
 # --------------------------------------------------------------------------------------
@@ -1054,6 +1120,14 @@ def create_assistant(api_key: str, db_path: Path, notes: str = "", cache: Option
     """One-call setup used by app.py. Returns (assistant, schema_context)."""
     sql_llm, text_llm = make_llms(api_key, cache)
     context = build_schema_context(db_path, notes)
+
+    con = _ro_connect(db_path)
+    try:
+        cols = {t: [r[1] for r in con.execute(f'PRAGMA table_info("{t}")')] for t in list_tables(db_path)}
+    finally:
+        con.close()
+    register_schema_terms(cols)
+
     engine = build_query_engine(sql_llm, db_path, context)
     assistant = TableAssistant(sql_llm=sql_llm, text_llm=text_llm, sql_engine=engine, db_path=Path(db_path),
                                notes=notes, llm_answers=llm_answers, llm_chart_spec=llm_chart_spec)
